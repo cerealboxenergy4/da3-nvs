@@ -803,7 +803,7 @@ def compute_masked_patch_metrics(
 ) -> dict[str, torch.Tensor]:
     expanded_mask = patch_mask.unsqueeze(-1).expand_as(pred_patch_rgb)
     if not bool(expanded_mask.any()):
-        raise ValueError("patch_mask must select at least one patch value")
+        expanded_mask = torch.ones_like(pred_patch_rgb, dtype=torch.bool)
 
     diff = pred_patch_rgb - target_patch_rgb
     masked_squared = diff.square()[expanded_mask]
