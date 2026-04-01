@@ -1,3 +1,7 @@
 *.pt
 outputs/
 outline.md
+*.err
+*.out
+*.pyc
+__pycache__/

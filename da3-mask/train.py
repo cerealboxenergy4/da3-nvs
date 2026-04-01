@@ -40,6 +40,41 @@ def log_progress(message: str) -> None:
     print(message, flush=True)
 
 
+def summarize_timing(total_seconds: float, count: int) -> dict[str, float]:
+    return {
+        "total_seconds": total_seconds,
+        "count": float(count),
+        "avg_seconds": (total_seconds / count) if count > 0 else 0.0,
+    }
+
+
+def build_lpips_loss_fn(device: str, net: str = "vgg") -> torch.nn.Module:
+    try:
+        import lpips
+    except ImportError as error:
+        raise RuntimeError(
+            "LPIPS loss requested but the `lpips` package is not installed."
+        ) from error
+
+    loss_fn = lpips.LPIPS(net=net).to(device)
+    loss_fn.eval()
+    loss_fn.requires_grad_(False)
+    return loss_fn
+
+
+def compute_lpips_loss(
+    loss_fn: torch.nn.Module,
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, num_views = pred_rgb.shape[:2]
+    pred_flat = pred_rgb.reshape(batch_size * num_views, *pred_rgb.shape[2:]).float()
+    target_flat = target_rgb.reshape(batch_size * num_views, *target_rgb.shape[2:]).float()
+    pred_flat = pred_flat * 2.0 - 1.0
+    target_flat = target_flat * 2.0 - 1.0
+    return loss_fn(pred_flat, target_flat).mean()
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a DA3 masked-patch RGB reconstruction experiment.")
     parser.add_argument(
@@ -150,6 +185,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument(
+        "--lpips-weight",
+        type=float,
+        default=0.1,
+        help="Weight for LPIPS in the total loss: L_rgb + lpips_weight * L_lpips.",
+    )
+    parser.add_argument(
+        "--lpips-net",
+        default="vgg",
+        choices=("alex", "vgg", "squeeze"),
+        help="Backbone used by LPIPS.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--device",
@@ -485,6 +532,7 @@ def run_masked_step(
     mask_ratio: float,
     mask_seed: int,
     background_threshold: float,
+    lpips_loss_fn: torch.nn.Module | None = None,
 ) -> tuple[dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch = move_mask_batch(batch, device)
     if split == "train":
@@ -519,6 +567,13 @@ def run_masked_step(
         f"{split}_masked_psnr": mse_to_psnr(float(mse.detach().item())),
         f"{split}_masked_patch_ratio": float(outputs.query_patch_mask.float().mean().item()),
     }
+    if lpips_loss_fn is not None:
+        lpips_loss = compute_lpips_loss(
+            lpips_loss_fn,
+            outputs.reconstructed_query_images,
+            query_images,
+        )
+        metrics[f"{split}_lpips_loss"] = float(lpips_loss.detach().item())
     return (
         metrics,
         outputs.masked_query_images.detach().cpu(),
@@ -531,12 +586,14 @@ def run_masked_step(
 def train_step(
     model: DA3MaskedPatchModel,
     optimizer: torch.optim.Optimizer,
+    lpips_loss_fn: torch.nn.Module | None,
     batch: MaskReconstructionBatch,
     *,
     device: str,
     mask_ratio: float,
     mask_seed: int,
     background_threshold: float,
+    lpips_weight: float,
 ) -> dict[str, float]:
     batch = move_mask_batch(batch, device)
     model.train()
@@ -557,7 +614,16 @@ def train_step(
         outputs.target_patch_rgb,
         outputs.query_patch_mask,
     )
-    loss = patch_metrics["mse"]
+    rgb_loss = patch_metrics["mse"]
+    if lpips_loss_fn is not None and lpips_weight > 0.0:
+        lpips_loss = compute_lpips_loss(
+            lpips_loss_fn,
+            outputs.reconstructed_query_images,
+            batch.train_query_images,
+        )
+    else:
+        lpips_loss = rgb_loss.new_zeros(())
+    loss = rgb_loss + (lpips_weight * lpips_loss)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
@@ -565,10 +631,12 @@ def train_step(
     loss_value = float(loss.detach().item())
     return {
         "loss": loss_value,
-        "train_masked_mse": loss_value,
+        "train_masked_mse": float(rgb_loss.detach().item()),
         "train_masked_mae": float(patch_metrics["mae"].detach().item()),
-        "train_masked_psnr": mse_to_psnr(loss_value),
+        "train_masked_psnr": mse_to_psnr(float(rgb_loss.detach().item())),
         "train_masked_patch_ratio": float(outputs.query_patch_mask.float().mean().item()),
+        "train_lpips_loss": float(lpips_loss.detach().item()),
+        "train_total_loss": loss_value,
     }
 
 
@@ -601,6 +669,42 @@ def save_loss_plot(
     axis.set_xlabel("Step")
     axis.set_ylabel("Masked Patch MSE")
     axis.set_title("da3-mask loss history")
+    axis.grid(alpha=0.3)
+    axis.legend()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+
+
+def save_psnr_plot(
+    train_history: list[dict[str, float]],
+    eval_history: list[dict[str, float]],
+    output_path: Path,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots(figsize=(8, 4.5))
+    axis.plot(
+        [item["step"] for item in train_history],
+        [item["train_masked_psnr"] for item in train_history],
+        marker="o",
+        linewidth=2,
+        label="train_masked_psnr",
+    )
+    if eval_history:
+        axis.plot(
+            [item["step"] for item in eval_history],
+            [item["eval_masked_psnr"] for item in eval_history],
+            marker="s",
+            linewidth=2,
+            label="eval_masked_psnr",
+        )
+    axis.set_xlabel("Step")
+    axis.set_ylabel("PSNR")
+    axis.set_title("da3-mask PSNR history")
     axis.grid(alpha=0.3)
     axis.legend()
     figure.tight_layout()
@@ -724,6 +828,8 @@ def main() -> None:
         raise ValueError("--mask-ratio must be in the range (0, 1]")
     if args.co3d_fallback_eval_ratio <= 0.0 or args.co3d_fallback_eval_ratio >= 1.0:
         raise ValueError("--co3d-fallback-eval-ratio must be in the range (0, 1)")
+    if args.lpips_weight < 0.0:
+        raise ValueError("--lpips-weight must be non-negative")
     if args.background_threshold < 0.0 or args.background_threshold >= 0.5:
         raise ValueError("--background-threshold must be in the range [0, 0.5)")
     if args.image_size % 14 != 0:
@@ -747,24 +853,36 @@ def main() -> None:
     start_time = time.perf_counter()
 
     log_progress("loading dataset...")
+    dataset_load_start = time.perf_counter()
     dataset = build_dataset(args)
+    dataset_load_seconds = time.perf_counter() - dataset_load_start
     log_progress(f"dataset loaded | scenes={len(dataset.scenes)} size={len(dataset)}")
+    log_progress(f"dataset loading took {dataset_load_seconds:.2f}s")
+
+    model_build_start = time.perf_counter()
     model = build_model(args)
+    model_build_seconds = time.perf_counter() - model_build_start
     log_progress("model object created")
+    log_progress(f"model construction took {model_build_seconds:.2f}s")
+
     log_progress("building first batch...")
+    first_batch_start = time.perf_counter()
     first_batch = build_step_batch(
         dataset,
         step_idx=0,
         batch_size=args.batch_size,
         base_seed=args.seed,
     )
+    first_batch_seconds = time.perf_counter() - first_batch_start
     log_progress(
         "first batch ready | "
         f"support={tuple(first_batch.support_images.shape)} "
         f"train_query={tuple(first_batch.train_query_images.shape)} "
         f"eval_query={tuple(first_batch.eval_query_images.shape)}"
     )
+    log_progress(f"first batch construction took {first_batch_seconds:.2f}s")
     log_progress("materializing trainable modules...")
+    materialize_start = time.perf_counter()
     materialize_trainable_modules(
         model,
         first_batch,
@@ -773,10 +891,23 @@ def main() -> None:
         seed=args.seed,
         background_threshold=args.background_threshold,
     )
+    materialize_seconds = time.perf_counter() - materialize_start
     log_progress("materialization done")
+    log_progress(f"materialization took {materialize_seconds:.2f}s")
     log_progress("building optimizer...")
+    optimizer_build_start = time.perf_counter()
     optimizer = build_optimizer(args, model)
+    optimizer_build_seconds = time.perf_counter() - optimizer_build_start
     log_progress("optimizer ready")
+    log_progress(f"optimizer construction took {optimizer_build_seconds:.2f}s")
+    lpips_build_seconds = 0.0
+    lpips_loss_fn: torch.nn.Module | None = None
+    if args.lpips_weight > 0.0:
+        log_progress("building LPIPS loss...")
+        lpips_build_start = time.perf_counter()
+        lpips_loss_fn = build_lpips_loss_fn(args.device, net=args.lpips_net)
+        lpips_build_seconds = time.perf_counter() - lpips_build_start
+        log_progress(f"LPIPS ready | net={args.lpips_net} build_time={lpips_build_seconds:.2f}s")
     trainable_params = count_trainable_parameters(model)
     train_history: list[dict[str, float]] = []
     eval_history: list[dict[str, float]] = []
@@ -848,8 +979,21 @@ def main() -> None:
     latest_eval_psnr: float | None = (
         float(eval_history[-1]["eval_masked_psnr"]) if eval_history else None
     )
+    latest_train_lpips: float | None = (
+        float(train_history[-1]["train_lpips_loss"]) if train_history and "train_lpips_loss" in train_history[-1] else None
+    )
+    latest_eval_lpips: float | None = (
+        float(eval_history[-1]["eval_lpips_loss"]) if eval_history and "eval_lpips_loss" in eval_history[-1] else None
+    )
+    batch_build_seconds_total = 0.0
+    batch_build_count = 0
+    train_step_seconds_total = 0.0
+    train_step_count = 0
+    eval_step_seconds_total = 0.0
+    eval_step_count = 0
 
     for step in progress:
+        batch_build_start = time.perf_counter()
         batch = (
             first_batch
             if step == 1 and completed_steps == 0
@@ -860,28 +1004,38 @@ def main() -> None:
                 base_seed=args.seed,
             )
         )
+        batch_build_seconds_total += time.perf_counter() - batch_build_start
+        batch_build_count += 1
         last_batch = batch
+        train_step_start = time.perf_counter()
         train_metrics = train_step(
             model,
             optimizer,
+            lpips_loss_fn,
             batch,
             device=args.device,
             mask_ratio=args.mask_ratio,
             mask_seed=args.seed + (step * 1009),
             background_threshold=args.background_threshold,
+            lpips_weight=args.lpips_weight,
         )
+        train_step_seconds_total += time.perf_counter() - train_step_start
+        train_step_count += 1
         train_history.append({"step": float(step), **train_metrics})
         latest_train_mse = train_metrics["train_masked_mse"]
         latest_train_psnr = train_metrics["train_masked_psnr"]
+        latest_train_lpips = train_metrics["train_lpips_loss"]
         if step == completed_steps + 1 or step % 50 == 0 or step == args.steps:
             log_progress(
                 f"step {step}/{args.steps} | "
                 f"train_mse={latest_train_mse:.6f} "
-                f"train_psnr={latest_train_psnr:.2f}"
+                f"train_psnr={latest_train_psnr:.2f} "
+                f"train_lpips={latest_train_lpips:.4f}"
             )
 
         if step % max(args.eval_every, 1) == 0:
             model.eval()
+            eval_step_start = time.perf_counter()
             with torch.no_grad():
                 eval_metrics, _, _, _, _ = run_masked_step(
                     model,
@@ -891,15 +1045,14 @@ def main() -> None:
                     mask_ratio=args.mask_ratio,
                     mask_seed=args.seed + (step * 2003) + 1,
                     background_threshold=args.background_threshold,
+                    lpips_loss_fn=lpips_loss_fn,
                 )
+            eval_step_seconds_total += time.perf_counter() - eval_step_start
+            eval_step_count += 1
             eval_history.append({"step": float(step), **eval_metrics})
             latest_eval_mse = eval_metrics["eval_masked_mse"]
             latest_eval_psnr = eval_metrics["eval_masked_psnr"]
-            log_progress(
-                f"eval step {step} | "
-                f"eval_mse={latest_eval_mse:.6f} "
-                f"eval_psnr={latest_eval_psnr:.2f}"
-            )
+            latest_eval_lpips = eval_metrics.get("eval_lpips_loss")
 
         current_lr = float(optimizer.param_groups[0]["lr"])
         progress.set_postfix(
@@ -909,11 +1062,14 @@ def main() -> None:
                 "eval_mse": f"{latest_eval_mse:.6f}" if latest_eval_mse is not None else "-",
                 "train_psnr": f"{latest_train_psnr:.2f}" if latest_train_psnr is not None else "-",
                 "eval_psnr": f"{latest_eval_psnr:.2f}" if latest_eval_psnr is not None else "-",
+                "train_lpips": f"{latest_train_lpips:.4f}" if latest_train_lpips is not None else "-",
+                "eval_lpips": f"{latest_eval_lpips:.4f}" if latest_eval_lpips is not None else "-",
             }
         )
 
     model.eval()
     log_progress("running final visualization passes...")
+    final_pass_start = time.perf_counter()
     with torch.no_grad():
         train_vis_metrics, train_masked_input, train_recon, train_gt, train_mask = run_masked_step(
             model,
@@ -923,6 +1079,7 @@ def main() -> None:
             mask_ratio=args.mask_ratio,
             mask_seed=args.seed + 90_001,
             background_threshold=args.background_threshold,
+            lpips_loss_fn=lpips_loss_fn,
         )
         eval_vis_metrics, eval_masked_input, eval_recon, eval_gt, eval_mask = run_masked_step(
             model,
@@ -932,9 +1089,12 @@ def main() -> None:
             mask_ratio=args.mask_ratio,
             mask_seed=args.seed + 90_002,
             background_threshold=args.background_threshold,
+            lpips_loss_fn=lpips_loss_fn,
         )
+    final_pass_seconds = time.perf_counter() - final_pass_start
 
     log_progress("saving visualizations and metrics...")
+    save_artifacts_start = time.perf_counter()
     combined_vis_paths = save_combined_visualization(
         train_masked_input_rgb=train_masked_input,
         train_recon_rgb=train_recon,
@@ -949,6 +1109,8 @@ def main() -> None:
         max_views=args.max_vis_views,
     )
     save_loss_plot(train_history, eval_history, output_dir / "loss_curve.png")
+    save_psnr_plot(train_history, eval_history, output_dir / "psnr_curve.png")
+    save_artifacts_seconds = time.perf_counter() - save_artifacts_start
 
     total_elapsed = elapsed_offset + (time.perf_counter() - start_time)
     if args.save_checkpoint:
@@ -969,6 +1131,7 @@ def main() -> None:
         "output_dir": str(output_dir),
         "checkpoint_path": str(checkpoint_path) if args.save_checkpoint else None,
         "loss_curve_path": str(output_dir / "loss_curve.png"),
+        "psnr_curve_path": str(output_dir / "psnr_curve.png"),
         "combined_visualization_paths": combined_vis_paths,
         "trainable_params": trainable_params,
         "optimizer": args.optimizer,
@@ -994,14 +1157,43 @@ def main() -> None:
         "backbone": args.backbone,
         "backbone_trainable": args.backbone_trainable,
         "elapsed_seconds": total_elapsed,
+        "timing": {
+            "dataset_load": summarize_timing(dataset_load_seconds, 1),
+            "model_build": summarize_timing(model_build_seconds, 1),
+            "first_batch": summarize_timing(first_batch_seconds, 1),
+            "materialize": summarize_timing(materialize_seconds, 1),
+            "optimizer_build": summarize_timing(optimizer_build_seconds, 1),
+            "lpips_build": summarize_timing(lpips_build_seconds, 1),
+            "batch_build": summarize_timing(batch_build_seconds_total, batch_build_count),
+            "train_step": summarize_timing(train_step_seconds_total, train_step_count),
+            "eval_step": summarize_timing(eval_step_seconds_total, eval_step_count),
+            "final_pass": summarize_timing(final_pass_seconds, 1),
+            "save_artifacts": summarize_timing(save_artifacts_seconds, 1),
+        },
+        "lpips_weight": args.lpips_weight,
+        "lpips_net": args.lpips_net,
         "final_train_metrics": train_vis_metrics,
         "final_eval_metrics": eval_vis_metrics,
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2))
+    timing = metrics_payload["timing"]
+    log_progress(
+        "timing summary | "
+        f"dataset_load={timing['dataset_load']['total_seconds']:.2f}s "
+        f"model_build={timing['model_build']['total_seconds']:.2f}s "
+        f"first_batch={timing['first_batch']['total_seconds']:.2f}s "
+        f"materialize={timing['materialize']['total_seconds']:.2f}s "
+        f"batch_build_avg={timing['batch_build']['avg_seconds']:.2f}s "
+        f"train_step_avg={timing['train_step']['avg_seconds']:.2f}s "
+        f"eval_step_avg={timing['eval_step']['avg_seconds']:.2f}s "
+        f"final_pass={timing['final_pass']['total_seconds']:.2f}s "
+        f"save_artifacts={timing['save_artifacts']['total_seconds']:.2f}s"
+    )
     print(f"training finished in {total_elapsed:.2f}s")
     if args.save_checkpoint:
         print(f"saved checkpoint to {checkpoint_path}")
     print(f"saved loss plot to {output_dir / 'loss_curve.png'}")
+    print(f"saved psnr plot to {output_dir / 'psnr_curve.png'}")
     if combined_vis_paths:
         print(f"saved combined visualization to {combined_vis_paths[0]}")
     print(f"saved metrics to {output_dir / 'metrics.json'}")
