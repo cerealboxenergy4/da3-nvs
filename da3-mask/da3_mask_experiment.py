@@ -24,6 +24,10 @@ from da3_nvs.models import CrossAttentionNVSHead, DA3PatchBackbone
 from da3_nvs.models.common import num_patches, patchify, unpatchify
 
 
+def debug_log(message: str) -> None:
+    print(message, flush=True)
+
+
 def _default_root() -> Path:
     return Path(__file__).resolve().parents[1] / "datasets" / "nerf_synthetic"
 
@@ -382,12 +386,58 @@ def _load_co3d_frame_annotations(
     return annotations
 
 
-def _load_co3d_set_lists(category_root: Path, set_list_name: str) -> dict[str, dict[str, tuple[CO3DFrameAnnotation, ...]]]:
-    set_list_path = category_root / "set_lists" / set_list_name
-    with open(set_list_path, "r", encoding="utf-8") as handle:
-        split_entries = json.load(handle)
+def _load_json_file(path: Path) -> dict | list:
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
 
-    return split_entries
+
+def _load_co3d_set_lists(
+    category_root: Path,
+    set_list_name: str,
+) -> tuple[dict[str, list], str] | None:
+    set_lists_dir = category_root / "set_lists"
+    if not set_lists_dir.exists():
+        return None
+
+    preferred_path = set_lists_dir / set_list_name
+    if preferred_path.exists():
+        data = _load_json_file(preferred_path)
+        if isinstance(data, dict):
+            return {key: list(value) for key, value in data.items()}, preferred_path.name
+
+    manyview_candidates = sorted(set_lists_dir.glob("set_lists_manyview*.json"))
+    if manyview_candidates:
+        chosen_path = manyview_candidates[0]
+        data = _load_json_file(chosen_path)
+        if isinstance(data, dict):
+            return {key: list(value) for key, value in data.items()}, chosen_path.name
+
+    fewview_paths = {
+        "train": set_lists_dir / "set_lists_fewview_train.json",
+        "val": set_lists_dir / "set_lists_fewview_dev.json",
+        "test": set_lists_dir / "set_lists_fewview_test.json",
+    }
+    if all(path.exists() for path in fewview_paths.values()):
+        split_entries: dict[str, list] = {}
+        for split_name, path in fewview_paths.items():
+            data = _load_json_file(path)
+            if isinstance(data, dict):
+                if split_name in data:
+                    split_entries[split_name] = list(data[split_name])
+                else:
+                    first_value = next(iter(data.values()), [])
+                    split_entries[split_name] = list(first_value)
+            else:
+                split_entries[split_name] = list(data)
+        return split_entries, "fewview(train/dev/test)"
+
+    json_paths = sorted(set_lists_dir.glob("*.json"))
+    for path in json_paths:
+        data = _load_json_file(path)
+        if isinstance(data, dict) and "train" in data and "test" in data:
+            return {key: list(value) for key, value in data.items()}, path.name
+
+    return None
 
 
 def _iter_co3d_category_roots(root: Path) -> list[Path]:
@@ -477,24 +527,34 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
         self._image_cache: dict[Path, torch.Tensor] = {}
         self.available_categories: tuple[str, ...] = ()
         self.skipped_categories: tuple[str, ...] = ()
+        self.category_set_lists: dict[str, str] = {}
 
         category_roots = _iter_co3d_category_roots(self.root)
+        debug_log(f"[co3d] scanning categories under {self.root} ({len(category_roots)} candidates)")
         split_map: dict[str, dict[str, list[CO3DFrameAnnotation]]] = {
             "train": {},
             "test": {},
         }
         available_categories: list[str] = []
         skipped_categories: list[str] = []
+        category_set_lists: dict[str, str] = {}
         for category_root in category_roots:
-            set_list_path = category_root / "set_lists" / self.set_list_name
-            if not set_list_path.exists():
+            resolved_set_lists = _load_co3d_set_lists(category_root, self.set_list_name)
+            if resolved_set_lists is None:
                 skipped_categories.append(category_root.name)
                 continue
 
+            raw_split_entries, resolved_name = resolved_set_lists
+            if resolved_name != self.set_list_name:
+                debug_log(
+                    f"[co3d] category {category_root.name} fallback set_lists: "
+                    f"{self.set_list_name} -> {resolved_name}"
+                )
+            debug_log(f"[co3d] loading category {category_root.name}")
             annotation_map = _load_co3d_frame_annotations(category_root, image_size=self.image_size)
-            raw_split_entries = _load_co3d_set_lists(category_root, self.set_list_name)
             category_name = category_root.name
             available_categories.append(category_name)
+            category_set_lists[category_name] = resolved_name
             for split_name in ("train", "test"):
                 for sequence_name, frame_number, _ in raw_split_entries.get(split_name, []):
                     key = (sequence_name, int(frame_number))
@@ -506,10 +566,15 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
 
         self.available_categories = tuple(sorted(available_categories))
         self.skipped_categories = tuple(sorted(skipped_categories))
+        self.category_set_lists = dict(sorted(category_set_lists.items()))
         if not self.available_categories:
             raise FileNotFoundError(
-                f"No CO3D categories under {self.root} contain set_lists/{self.set_list_name}"
+                f"No CO3D categories under {self.root} contain usable set_lists json files"
             )
+        debug_log(
+            f"[co3d] categories ready | usable={len(self.available_categories)} "
+            f"skipped_missing_set_list={len(self.skipped_categories)}"
+        )
 
         available_scene_ids = sorted(
             scene_id

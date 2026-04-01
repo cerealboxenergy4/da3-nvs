@@ -36,6 +36,10 @@ from da3_mask_experiment import (
 )
 
 
+def log_progress(message: str) -> None:
+    print(message, flush=True)
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a DA3 masked-patch RGB reconstruction experiment.")
     parser.add_argument(
@@ -162,7 +166,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--co3d-set-list",
         default="set_lists_manyview_dev_0.json",
-        help="CO3D many-view split file under <category>/set_lists. Train uses the file's train split and eval uses its test split.",
+        help="Preferred CO3D set_lists file. If missing, the loader falls back to available manyview jsons or fewview train/dev/test files in that category.",
     )
     parser.add_argument(
         "--eval-every",
@@ -719,22 +723,39 @@ def main() -> None:
         raise FileNotFoundError(f"resume checkpoint not found: {args.resume}")
 
     os.environ["DA3_LOG_LEVEL"] = args.da3_log_level
+    log_progress("starting da3-mask training")
+    log_progress(
+        f"args parsed | dataset={args.dataset} backbone={args.backbone} head={args.head_type} "
+        f"steps={args.steps} batch_size={args.batch_size} root={args.root}"
+    )
     if args.resume is not None and args.output_dir is None:
         output_dir = args.resume.resolve().parent
     else:
         output_dir = args.output_dir if args.output_dir is not None else build_default_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / "checkpoint.pt"
+    log_progress(f"output dir ready: {output_dir}")
     start_time = time.perf_counter()
 
+    log_progress("loading dataset...")
     dataset = build_dataset(args)
+    log_progress(f"dataset loaded | scenes={len(dataset.scenes)} size={len(dataset)}")
     model = build_model(args)
+    log_progress("model object created")
+    log_progress("building first batch...")
     first_batch = build_step_batch(
         dataset,
         step_idx=0,
         batch_size=args.batch_size,
         base_seed=args.seed,
     )
+    log_progress(
+        "first batch ready | "
+        f"support={tuple(first_batch.support_images.shape)} "
+        f"train_query={tuple(first_batch.train_query_images.shape)} "
+        f"eval_query={tuple(first_batch.eval_query_images.shape)}"
+    )
+    log_progress("materializing trainable modules...")
     materialize_trainable_modules(
         model,
         first_batch,
@@ -743,7 +764,10 @@ def main() -> None:
         seed=args.seed,
         background_threshold=args.background_threshold,
     )
+    log_progress("materialization done")
+    log_progress("building optimizer...")
     optimizer = build_optimizer(args, model)
+    log_progress("optimizer ready")
     trainable_params = count_trainable_parameters(model)
     train_history: list[dict[str, float]] = []
     eval_history: list[dict[str, float]] = []
@@ -752,6 +776,7 @@ def main() -> None:
     last_batch = first_batch
 
     if args.resume is not None:
+        log_progress(f"loading checkpoint from {args.resume}...")
         train_history, eval_history, elapsed_offset = load_checkpoint(args.resume, model, optimizer)
         completed_steps = int(train_history[-1]["step"]) if train_history else 0
         reference_step = max(completed_steps - 1, 0)
@@ -761,6 +786,7 @@ def main() -> None:
             batch_size=args.batch_size,
             base_seed=args.seed,
         )
+        log_progress(f"checkpoint loaded | completed_steps={completed_steps}")
 
     print(
         f"da3-mask start | dataset={args.dataset} backbone={args.backbone} device={args.device} "
@@ -777,9 +803,19 @@ def main() -> None:
             f"co3d categories used={len(dataset.available_categories)} "
             f"skipped_missing_set_list={len(getattr(dataset, 'skipped_categories', ()))}"
         )
+        if getattr(dataset, "skipped_categories", ()):
+            preview = ", ".join(list(dataset.skipped_categories)[:10])
+            suffix = " ..." if len(dataset.skipped_categories) > 10 else ""
+            log_progress(f"co3d skipped categories preview: {preview}{suffix}")
+        if getattr(dataset, "category_set_lists", {}):
+            preview_items = list(dataset.category_set_lists.items())[:10]
+            preview = ", ".join(f"{category}:{name}" for category, name in preview_items)
+            suffix = " ..." if len(dataset.category_set_lists) > 10 else ""
+            log_progress(f"co3d set_lists preview: {preview}{suffix}")
     if args.resume is not None:
         print(f"resuming from {args.resume} at completed_step={completed_steps}")
 
+    log_progress("entering training loop")
     progress = tqdm(
         range(completed_steps + 1, args.steps + 1),
         desc="train",
@@ -825,6 +861,12 @@ def main() -> None:
         train_history.append({"step": float(step), **train_metrics})
         latest_train_mse = train_metrics["train_masked_mse"]
         latest_train_psnr = train_metrics["train_masked_psnr"]
+        if step == completed_steps + 1 or step % 50 == 0 or step == args.steps:
+            log_progress(
+                f"step {step}/{args.steps} | "
+                f"train_mse={latest_train_mse:.6f} "
+                f"train_psnr={latest_train_psnr:.2f}"
+            )
 
         if step % max(args.eval_every, 1) == 0:
             model.eval()
@@ -841,6 +883,11 @@ def main() -> None:
             eval_history.append({"step": float(step), **eval_metrics})
             latest_eval_mse = eval_metrics["eval_masked_mse"]
             latest_eval_psnr = eval_metrics["eval_masked_psnr"]
+            log_progress(
+                f"eval step {step} | "
+                f"eval_mse={latest_eval_mse:.6f} "
+                f"eval_psnr={latest_eval_psnr:.2f}"
+            )
 
         current_lr = float(optimizer.param_groups[0]["lr"])
         progress.set_postfix(
@@ -854,6 +901,7 @@ def main() -> None:
         )
 
     model.eval()
+    log_progress("running final visualization passes...")
     with torch.no_grad():
         train_vis_metrics, train_masked_input, train_recon, train_gt, train_mask = run_masked_step(
             model,
@@ -874,6 +922,7 @@ def main() -> None:
             background_threshold=args.background_threshold,
         )
 
+    log_progress("saving visualizations and metrics...")
     combined_vis_paths = save_combined_visualization(
         train_masked_input_rgb=train_masked_input,
         train_recon_rgb=train_recon,
@@ -923,6 +972,7 @@ def main() -> None:
         "co3d_set_list": args.co3d_set_list if args.dataset == "co3d" else None,
         "co3d_available_categories": list(getattr(dataset, "available_categories", ())),
         "co3d_skipped_categories": list(getattr(dataset, "skipped_categories", ())),
+        "co3d_category_set_lists": dict(getattr(dataset, "category_set_lists", {})),
         "head_type": args.head_type,
         "head_hidden_dim": args.head_hidden_dim,
         "cross_attn_heads": args.cross_attn_heads,
