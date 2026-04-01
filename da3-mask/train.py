@@ -166,7 +166,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--co3d-set-list",
         default="set_lists_manyview_dev_0.json",
-        help="Preferred CO3D set_lists file. If missing, the loader falls back to available manyview jsons or fewview train/dev/test files in that category.",
+        help="Preferred CO3D set_lists filename. Manyview files are used per-sequence when available; fewview-only categories fall back to sequence-wise random splitting over frames referenced by their fewview jsons.",
+    )
+    parser.add_argument(
+        "--co3d-fallback-eval-ratio",
+        type=float,
+        default=0.1,
+        help="Eval ratio used when a CO3D scene must be split from available frames instead of using a direct manyview train/eval split.",
     )
     parser.add_argument(
         "--eval-every",
@@ -348,6 +354,7 @@ def build_dataset(
             eval_query_views=args.eval_query_views,
             set_list_name=args.co3d_set_list,
             size=dataset_size,
+            fallback_eval_ratio=args.co3d_fallback_eval_ratio,
         )
 
     return MaskReconstructionDataset(
@@ -715,6 +722,8 @@ def main() -> None:
         raise ValueError("--batch-size must be positive")
     if args.mask_ratio <= 0.0 or args.mask_ratio > 1.0:
         raise ValueError("--mask-ratio must be in the range (0, 1]")
+    if args.co3d_fallback_eval_ratio <= 0.0 or args.co3d_fallback_eval_ratio >= 1.0:
+        raise ValueError("--co3d-fallback-eval-ratio must be in the range (0, 1)")
     if args.background_threshold < 0.0 or args.background_threshold >= 0.5:
         raise ValueError("--background-threshold must be in the range [0, 0.5)")
     if args.image_size % 14 != 0:
@@ -809,7 +818,10 @@ def main() -> None:
             log_progress(f"co3d skipped categories preview: {preview}{suffix}")
         if getattr(dataset, "category_set_lists", {}):
             preview_items = list(dataset.category_set_lists.items())[:10]
-            preview = ", ".join(f"{category}:{name}" for category, name in preview_items)
+            preview = ", ".join(
+                f"{category}:{'|'.join(names[:3])}{'...' if len(names) > 3 else ''}"
+                for category, names in preview_items
+            )
             suffix = " ..." if len(dataset.category_set_lists) > 10 else ""
             log_progress(f"co3d set_lists preview: {preview}{suffix}")
     if args.resume is not None:
@@ -970,6 +982,7 @@ def main() -> None:
         "dataset": args.dataset,
         "root": str(args.root),
         "co3d_set_list": args.co3d_set_list if args.dataset == "co3d" else None,
+        "co3d_fallback_eval_ratio": args.co3d_fallback_eval_ratio if args.dataset == "co3d" else None,
         "co3d_available_categories": list(getattr(dataset, "available_categories", ())),
         "co3d_skipped_categories": list(getattr(dataset, "skipped_categories", ())),
         "co3d_category_set_lists": dict(getattr(dataset, "category_set_lists", {})),

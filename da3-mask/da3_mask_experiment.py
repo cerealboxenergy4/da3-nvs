@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import gzip
+import inspect
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -65,6 +67,128 @@ class CO3DFrameAnnotation:
     mask_path: Path | None
     intrinsics: torch.Tensor
     c2w: torch.Tensor
+
+
+def _try_import_co3d_dataset_class():
+    try:
+        from co3d.dataset.co3d_dataset import Co3dDataset
+    except ImportError:
+        return None
+    return Co3dDataset
+
+
+class OfficialCo3dImageBackend:
+    def __init__(
+        self,
+        *,
+        category_root: Path,
+        image_size: int,
+        white_background: bool,
+    ) -> None:
+        co3d_dataset_cls = _try_import_co3d_dataset_class()
+        if co3d_dataset_cls is None:
+            raise RuntimeError("co3d.dataset.co3d_dataset.Co3dDataset is not importable")
+
+        dataset_root = category_root.parent
+        signature = inspect.signature(co3d_dataset_cls)
+        candidate_kwargs = {
+            "dataset_root": str(dataset_root),
+            "frame_annotations_file": str(category_root / "frame_annotations.jgz"),
+            "sequence_annotations_file": str(category_root / "sequence_annotations.jgz"),
+            "subset_lists_file": None,
+            "subsets": None,
+            "subset": None,
+            "path_manager": None,
+            "pick_sequence": None,
+            "image_height": image_size,
+            "image_width": image_size,
+            "box_crop": False,
+            "box_crop_context": 0.0,
+            "remove_empty_masks": False,
+            "load_images": True,
+            "load_masks": False,
+            "load_depths": False,
+            "load_depth_masks": False,
+            "load_point_clouds": False,
+            "mask_images": False,
+        }
+        init_kwargs = {
+            name: candidate_kwargs[name]
+            for name in signature.parameters.keys()
+            if name != "self" and name in candidate_kwargs
+        }
+        self.dataset = co3d_dataset_cls(**init_kwargs)
+        self.image_size = image_size
+        self.white_background = white_background
+        self.index_by_key = self._build_index()
+
+    @staticmethod
+    def _extract_attr(value, names: Sequence[str]):
+        for name in names:
+            if isinstance(value, dict) and name in value:
+                return value[name]
+            if hasattr(value, name):
+                return getattr(value, name)
+        return None
+
+    def _build_index(self) -> dict[tuple[str, int], int]:
+        frame_annots = getattr(self.dataset, "frame_annots", None)
+        if frame_annots is None:
+            frame_annots = getattr(self.dataset, "frame_annotations", None)
+        if frame_annots is None:
+            raise RuntimeError("Official Co3dDataset does not expose frame annotations")
+
+        index_by_key: dict[tuple[str, int], int] = {}
+        for dataset_index, annotation in enumerate(frame_annots):
+            sequence_name = self._extract_attr(annotation, ("sequence_name",))
+            frame_number = self._extract_attr(annotation, ("frame_number",))
+            if sequence_name is None:
+                frame_annotation = self._extract_attr(annotation, ("frame_annotation",))
+                if frame_annotation is not None:
+                    sequence_name = self._extract_attr(frame_annotation, ("sequence_name",))
+                    frame_number = self._extract_attr(frame_annotation, ("frame_number",))
+            if sequence_name is None or frame_number is None:
+                continue
+            index_by_key[(str(sequence_name), int(frame_number))] = dataset_index
+        if not index_by_key:
+            raise RuntimeError("Official Co3dDataset frame annotation index is empty")
+        return index_by_key
+
+    def load_image(self, sequence_name: str, frame_number: int) -> torch.Tensor:
+        dataset_index = self.index_by_key.get((sequence_name, int(frame_number)))
+        if dataset_index is None:
+            raise KeyError(f"Official Co3dDataset is missing frame {(sequence_name, frame_number)}")
+
+        frame_data = self.dataset[dataset_index]
+        image = getattr(frame_data, "image_rgb", None)
+        if image is None:
+            image = getattr(frame_data, "image", None)
+        if image is None:
+            raise RuntimeError("Official Co3dDataset frame does not expose image_rgb/image")
+
+        if image.dim() == 4:
+            image = image[0]
+        if image.dim() != 3:
+            raise RuntimeError(f"Unexpected official CO3D image shape: {tuple(image.shape)}")
+        image = image.float()
+        if image.max() > 1.0:
+            image = image / 255.0
+
+        fg_probability = getattr(frame_data, "fg_probability", None)
+        if self.white_background and fg_probability is not None:
+            if fg_probability.dim() == 4:
+                fg_probability = fg_probability[0]
+            if fg_probability.dim() == 3 and fg_probability.shape[0] == 1:
+                image = image * fg_probability + (1.0 - fg_probability)
+
+        if tuple(image.shape[-2:]) != (self.image_size, self.image_size):
+            image = F.interpolate(
+                image.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+        return image.contiguous()
 
 
 class ToyPatchBackbone(nn.Module):
@@ -391,53 +515,58 @@ def _load_json_file(path: Path) -> dict | list:
         return json.load(handle)
 
 
-def _load_co3d_set_lists(
-    category_root: Path,
-    set_list_name: str,
-) -> tuple[dict[str, list], str] | None:
+def _list_co3d_set_list_paths(category_root: Path) -> list[Path]:
     set_lists_dir = category_root / "set_lists"
     if not set_lists_dir.exists():
-        return None
+        return []
+    return sorted(set_lists_dir.glob("*.json"))
 
-    preferred_path = set_lists_dir / set_list_name
-    if preferred_path.exists():
-        data = _load_json_file(preferred_path)
-        if isinstance(data, dict):
-            return {key: list(value) for key, value in data.items()}, preferred_path.name
 
-    manyview_candidates = sorted(set_lists_dir.glob("set_lists_manyview*.json"))
-    if manyview_candidates:
-        chosen_path = manyview_candidates[0]
-        data = _load_json_file(chosen_path)
-        if isinstance(data, dict):
-            return {key: list(value) for key, value in data.items()}, chosen_path.name
+def _split_co3d_set_list_paths(set_list_paths: list[Path]) -> tuple[list[Path], list[Path]]:
+    manyview_paths = [path for path in set_list_paths if "manyview" in path.name]
+    fewview_paths = [path for path in set_list_paths if "fewview" in path.name]
+    return manyview_paths, fewview_paths
 
-    fewview_paths = {
-        "train": set_lists_dir / "set_lists_fewview_train.json",
-        "val": set_lists_dir / "set_lists_fewview_dev.json",
-        "test": set_lists_dir / "set_lists_fewview_test.json",
-    }
-    if all(path.exists() for path in fewview_paths.values()):
-        split_entries: dict[str, list] = {}
-        for split_name, path in fewview_paths.items():
-            data = _load_json_file(path)
-            if isinstance(data, dict):
-                if split_name in data:
-                    split_entries[split_name] = list(data[split_name])
-                else:
-                    first_value = next(iter(data.values()), [])
-                    split_entries[split_name] = list(first_value)
-            else:
-                split_entries[split_name] = list(data)
-        return split_entries, "fewview(train/dev/test)"
 
-    json_paths = sorted(set_lists_dir.glob("*.json"))
-    for path in json_paths:
-        data = _load_json_file(path)
-        if isinstance(data, dict) and "train" in data and "test" in data:
-            return {key: list(value) for key, value in data.items()}, path.name
+def _entries_to_annotations_by_sequence(
+    entries: list,
+    annotation_map: dict[tuple[str, int], CO3DFrameAnnotation],
+) -> dict[str, list[CO3DFrameAnnotation]]:
+    grouped: dict[str, list[CO3DFrameAnnotation]] = {}
+    for sequence_name, frame_number, _ in entries:
+        annotation = annotation_map.get((sequence_name, int(frame_number)))
+        if annotation is None:
+            continue
+        grouped.setdefault(sequence_name, []).append(annotation)
+    return grouped
 
-    return None
+
+def _merge_unique_annotations(
+    annotations: list[CO3DFrameAnnotation],
+) -> tuple[CO3DFrameAnnotation, ...]:
+    unique: dict[int, CO3DFrameAnnotation] = {}
+    for annotation in annotations:
+        unique[int(annotation.frame_number)] = annotation
+    return tuple(unique[key] for key in sorted(unique))
+
+
+def _random_split_annotations(
+    annotations: tuple[CO3DFrameAnnotation, ...],
+    *,
+    eval_ratio: float,
+    seed_key: str,
+) -> tuple[tuple[CO3DFrameAnnotation, ...], tuple[CO3DFrameAnnotation, ...]]:
+    if len(annotations) < 2:
+        return annotations, annotations
+
+    annotations_list = list(annotations)
+    rng = random.Random(seed_key)
+    rng.shuffle(annotations_list)
+    eval_count = max(1, int(round(len(annotations_list) * eval_ratio)))
+    eval_count = min(eval_count, len(annotations_list) - 1)
+    eval_split = tuple(sorted(annotations_list[:eval_count], key=lambda item: item.frame_number))
+    train_split = tuple(sorted(annotations_list[eval_count:], key=lambda item: item.frame_number))
+    return train_split, eval_split
 
 
 def _iter_co3d_category_roots(root: Path) -> list[Path]:
@@ -511,6 +640,8 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
         eval_query_views: int = 4,
         set_list_name: str = "set_lists_manyview_dev_0.json",
         size: int = 128,
+        fallback_eval_ratio: float = 0.1,
+        fallback_split_seed: int = 0,
         white_background: bool = True,
         cache_images: bool = True,
     ) -> None:
@@ -522,47 +653,112 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
         self.train_query_views = train_query_views
         self.eval_query_views = eval_query_views
         self.set_list_name = set_list_name
+        self.fallback_eval_ratio = fallback_eval_ratio
+        self.fallback_split_seed = fallback_split_seed
         self.white_background = white_background
         self.cache_images = cache_images
         self._image_cache: dict[Path, torch.Tensor] = {}
+        self.official_image_backends: dict[str, OfficialCo3dImageBackend] = {}
         self.available_categories: tuple[str, ...] = ()
         self.skipped_categories: tuple[str, ...] = ()
-        self.category_set_lists: dict[str, str] = {}
+        self.category_set_lists: dict[str, tuple[str, ...]] = {}
 
         category_roots = _iter_co3d_category_roots(self.root)
         debug_log(f"[co3d] scanning categories under {self.root} ({len(category_roots)} candidates)")
-        split_map: dict[str, dict[str, list[CO3DFrameAnnotation]]] = {
-            "train": {},
-            "test": {},
-        }
+        scene_train_pools: dict[str, tuple[CO3DFrameAnnotation, ...]] = {}
+        scene_eval_pools: dict[str, tuple[CO3DFrameAnnotation, ...]] = {}
         available_categories: list[str] = []
         skipped_categories: list[str] = []
-        category_set_lists: dict[str, str] = {}
+        category_set_lists: dict[str, tuple[str, ...]] = {}
         for category_root in category_roots:
-            resolved_set_lists = _load_co3d_set_lists(category_root, self.set_list_name)
-            if resolved_set_lists is None:
+            set_list_paths = _list_co3d_set_list_paths(category_root)
+            if not set_list_paths:
                 skipped_categories.append(category_root.name)
                 continue
 
-            raw_split_entries, resolved_name = resolved_set_lists
-            if resolved_name != self.set_list_name:
-                debug_log(
-                    f"[co3d] category {category_root.name} fallback set_lists: "
-                    f"{self.set_list_name} -> {resolved_name}"
-                )
             debug_log(f"[co3d] loading category {category_root.name}")
             annotation_map = _load_co3d_frame_annotations(category_root, image_size=self.image_size)
             category_name = category_root.name
             available_categories.append(category_name)
-            category_set_lists[category_name] = resolved_name
-            for split_name in ("train", "test"):
-                for sequence_name, frame_number, _ in raw_split_entries.get(split_name, []):
-                    key = (sequence_name, int(frame_number))
-                    annotation = annotation_map.get(key)
-                    if annotation is None:
-                        continue
+            category_set_lists[category_name] = tuple(path.name for path in set_list_paths)
+            try:
+                self.official_image_backends[category_name] = OfficialCo3dImageBackend(
+                    category_root=category_root,
+                    image_size=self.image_size,
+                    white_background=self.white_background,
+                )
+                debug_log(f"[co3d] category {category_name} using official Co3dDataset image backend")
+            except Exception as error:
+                debug_log(
+                    f"[co3d] category {category_name} official Co3dDataset unavailable, "
+                    f"falling back to direct image loading: {error}"
+                )
+
+            manyview_paths, fewview_paths = _split_co3d_set_list_paths(set_list_paths)
+            manyview_scene_ids: set[str] = set()
+            for path in manyview_paths:
+                raw_split_entries = _load_json_file(path)
+                if not isinstance(raw_split_entries, dict):
+                    continue
+                train_by_sequence = _entries_to_annotations_by_sequence(
+                    list(raw_split_entries.get("train", [])),
+                    annotation_map,
+                )
+                eval_entries = list(raw_split_entries.get("val", [])) + list(raw_split_entries.get("test", []))
+                eval_by_sequence = _entries_to_annotations_by_sequence(
+                    eval_entries,
+                    annotation_map,
+                )
+                sequence_names = sorted(set(train_by_sequence) | set(eval_by_sequence))
+                for sequence_name in sequence_names:
                     scene_id = _co3d_scene_id(category_name, sequence_name)
-                    split_map[split_name].setdefault(scene_id, []).append(annotation)
+                    train_annotations = _merge_unique_annotations(train_by_sequence.get(sequence_name, []))
+                    eval_annotations = _merge_unique_annotations(eval_by_sequence.get(sequence_name, []))
+                    if len(train_annotations) == 0 and len(eval_annotations) > 1:
+                        train_annotations, eval_annotations = _random_split_annotations(
+                            eval_annotations,
+                            eval_ratio=self.fallback_eval_ratio,
+                            seed_key=f"{scene_id}:{self.fallback_split_seed}:manyview-eval-only",
+                        )
+                    elif len(eval_annotations) == 0 and len(train_annotations) > 1:
+                        train_annotations, eval_annotations = _random_split_annotations(
+                            train_annotations,
+                            eval_ratio=self.fallback_eval_ratio,
+                            seed_key=f"{scene_id}:{self.fallback_split_seed}:manyview-train-only",
+                        )
+                    if len(train_annotations) == 0 or len(eval_annotations) == 0:
+                        continue
+                    scene_train_pools[scene_id] = train_annotations
+                    scene_eval_pools[scene_id] = eval_annotations
+                    manyview_scene_ids.add(scene_id)
+
+            if fewview_paths:
+                fewview_annotations_by_sequence: dict[str, list[CO3DFrameAnnotation]] = {}
+                for path in fewview_paths:
+                    raw_split_entries = _load_json_file(path)
+                    if not isinstance(raw_split_entries, dict):
+                        continue
+                    for split_entries in raw_split_entries.values():
+                        grouped = _entries_to_annotations_by_sequence(list(split_entries), annotation_map)
+                        for sequence_name, annotations in grouped.items():
+                            fewview_annotations_by_sequence.setdefault(sequence_name, []).extend(annotations)
+
+                for sequence_name, annotations in fewview_annotations_by_sequence.items():
+                    scene_id = _co3d_scene_id(category_name, sequence_name)
+                    if scene_id in manyview_scene_ids:
+                        continue
+                    merged_annotations = _merge_unique_annotations(annotations)
+                    if len(merged_annotations) < 2:
+                        continue
+                    train_annotations, eval_annotations = _random_split_annotations(
+                        merged_annotations,
+                        eval_ratio=self.fallback_eval_ratio,
+                        seed_key=f"{scene_id}:{self.fallback_split_seed}:fewview-fallback",
+                    )
+                    if len(train_annotations) == 0 or len(eval_annotations) == 0:
+                        continue
+                    scene_train_pools[scene_id] = train_annotations
+                    scene_eval_pools[scene_id] = eval_annotations
 
         self.available_categories = tuple(sorted(available_categories))
         self.skipped_categories = tuple(sorted(skipped_categories))
@@ -578,8 +774,8 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
 
         available_scene_ids = sorted(
             scene_id
-            for scene_id in split_map["train"].keys()
-            if split_map["train"].get(scene_id) and split_map["test"].get(scene_id)
+            for scene_id in scene_train_pools.keys()
+            if scene_train_pools.get(scene_id) and scene_eval_pools.get(scene_id)
         )
         self.scenes = _resolve_requested_co3d_scene_ids(
             sequence_names,
@@ -589,11 +785,11 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
             raise ValueError(f"no usable CO3D scenes found under {self.root}")
 
         self.train_pools = {
-            scene_id: tuple(split_map["train"][scene_id])
+            scene_id: tuple(scene_train_pools[scene_id])
             for scene_id in self.scenes
         }
         self.eval_pools = {
-            scene_id: tuple(split_map["test"][scene_id])
+            scene_id: tuple(scene_eval_pools[scene_id])
             for scene_id in self.scenes
         }
         self.size = max(size, len(self.scenes))
@@ -614,6 +810,18 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
             self._image_cache[image_path] = image
         return image
 
+    def _load_co3d_image(self, annotation: CO3DFrameAnnotation) -> torch.Tensor:
+        backend = self.official_image_backends.get(annotation.category_name)
+        if backend is not None:
+            try:
+                return backend.load_image(annotation.sequence_name, annotation.frame_number)
+            except Exception as error:
+                debug_log(
+                    f"[co3d] official image backend miss for "
+                    f"{annotation.category_name}/{annotation.sequence_name}/{annotation.frame_number}: {error}"
+                )
+        return self._load_image(annotation.image_path)
+
     def _build_bundle(
         self,
         frame_pool: tuple[CO3DFrameAnnotation, ...],
@@ -622,7 +830,7 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
         offset: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         selected_frames = _select_frames(frame_pool, view_count, offset=offset)
-        images = torch.stack([self._load_image(frame.image_path) for frame in selected_frames], dim=0)
+        images = torch.stack([self._load_co3d_image(frame) for frame in selected_frames], dim=0)
         intrinsics = torch.stack([frame.intrinsics.clone() for frame in selected_frames], dim=0)
         c2w = torch.stack([frame.c2w.clone() for frame in selected_frames], dim=0)
         return images, intrinsics, c2w
