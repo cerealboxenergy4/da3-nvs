@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "da3-nvs"
+version = "0.1.0"
+description = "Ray-augmented novel-view synthesis prototype built on top of Depth Anything 3."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.8",
+    "pillow>=10.0",
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+da3 = [
+    "safetensors>=0.4.0",
+]
+perceptual = [
+    "lpips>=0.1.4",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
