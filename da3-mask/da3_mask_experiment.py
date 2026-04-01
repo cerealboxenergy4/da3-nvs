@@ -475,16 +475,26 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
         self.white_background = white_background
         self.cache_images = cache_images
         self._image_cache: dict[Path, torch.Tensor] = {}
+        self.available_categories: tuple[str, ...] = ()
+        self.skipped_categories: tuple[str, ...] = ()
 
         category_roots = _iter_co3d_category_roots(self.root)
         split_map: dict[str, dict[str, list[CO3DFrameAnnotation]]] = {
             "train": {},
             "test": {},
         }
+        available_categories: list[str] = []
+        skipped_categories: list[str] = []
         for category_root in category_roots:
+            set_list_path = category_root / "set_lists" / self.set_list_name
+            if not set_list_path.exists():
+                skipped_categories.append(category_root.name)
+                continue
+
             annotation_map = _load_co3d_frame_annotations(category_root, image_size=self.image_size)
             raw_split_entries = _load_co3d_set_lists(category_root, self.set_list_name)
             category_name = category_root.name
+            available_categories.append(category_name)
             for split_name in ("train", "test"):
                 for sequence_name, frame_number, _ in raw_split_entries.get(split_name, []):
                     key = (sequence_name, int(frame_number))
@@ -493,6 +503,13 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
                         continue
                     scene_id = _co3d_scene_id(category_name, sequence_name)
                     split_map[split_name].setdefault(scene_id, []).append(annotation)
+
+        self.available_categories = tuple(sorted(available_categories))
+        self.skipped_categories = tuple(sorted(skipped_categories))
+        if not self.available_categories:
+            raise FileNotFoundError(
+                f"No CO3D categories under {self.root} contain set_lists/{self.set_list_name}"
+            )
 
         available_scene_ids = sorted(
             scene_id

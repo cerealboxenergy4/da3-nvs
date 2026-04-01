@@ -772,6 +772,11 @@ def main() -> None:
         f"output_dir={output_dir} trainable_params={trainable_params} "
         f"optimizer={args.optimizer} lr={args.lr} backbone_trainable={args.backbone_trainable}"
     )
+    if args.dataset == "co3d" and hasattr(dataset, "available_categories"):
+        print(
+            f"co3d categories used={len(dataset.available_categories)} "
+            f"skipped_missing_set_list={len(getattr(dataset, 'skipped_categories', ()))}"
+        )
     if args.resume is not None:
         print(f"resuming from {args.resume} at completed_step={completed_steps}")
 
@@ -916,6 +921,8 @@ def main() -> None:
         "dataset": args.dataset,
         "root": str(args.root),
         "co3d_set_list": args.co3d_set_list if args.dataset == "co3d" else None,
+        "co3d_available_categories": list(getattr(dataset, "available_categories", ())),
+        "co3d_skipped_categories": list(getattr(dataset, "skipped_categories", ())),
         "head_type": args.head_type,
         "head_hidden_dim": args.head_hidden_dim,
         "cross_attn_heads": args.cross_attn_heads,
