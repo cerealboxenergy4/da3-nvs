@@ -662,6 +662,7 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
         self.available_categories: tuple[str, ...] = ()
         self.skipped_categories: tuple[str, ...] = ()
         self.category_set_lists: dict[str, tuple[str, ...]] = {}
+        self.category_debug_stats: dict[str, dict[str, int]] = {}
 
         category_roots = _iter_co3d_category_roots(self.root)
         debug_log(f"[co3d] scanning categories under {self.root} ({len(category_roots)} candidates)")
@@ -670,6 +671,7 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
         available_categories: list[str] = []
         skipped_categories: list[str] = []
         category_set_lists: dict[str, tuple[str, ...]] = {}
+        category_debug_stats: dict[str, dict[str, int]] = {}
         for category_root in category_roots:
             set_list_paths = _list_co3d_set_list_paths(category_root)
             if not set_list_paths:
@@ -681,6 +683,15 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
             category_name = category_root.name
             available_categories.append(category_name)
             category_set_lists[category_name] = tuple(path.name for path in set_list_paths)
+            category_stats = {
+                "annotations_with_existing_images": len(annotation_map),
+                "manyview_files": 0,
+                "fewview_files": 0,
+                "manyview_sequences_total": 0,
+                "manyview_sequences_usable": 0,
+                "fewview_sequences_total": 0,
+                "fewview_sequences_usable": 0,
+            }
             try:
                 self.official_image_backends[category_name] = OfficialCo3dImageBackend(
                     category_root=category_root,
@@ -695,7 +706,10 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
                 )
 
             manyview_paths, fewview_paths = _split_co3d_set_list_paths(set_list_paths)
+            category_stats["manyview_files"] = len(manyview_paths)
+            category_stats["fewview_files"] = len(fewview_paths)
             manyview_scene_ids: set[str] = set()
+            manyview_sequences_seen: set[str] = set()
             for path in manyview_paths:
                 raw_split_entries = _load_json_file(path)
                 if not isinstance(raw_split_entries, dict):
@@ -710,6 +724,7 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
                     annotation_map,
                 )
                 sequence_names = sorted(set(train_by_sequence) | set(eval_by_sequence))
+                manyview_sequences_seen.update(sequence_names)
                 for sequence_name in sequence_names:
                     scene_id = _co3d_scene_id(category_name, sequence_name)
                     train_annotations = _merge_unique_annotations(train_by_sequence.get(sequence_name, []))
@@ -731,6 +746,8 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
                     scene_train_pools[scene_id] = train_annotations
                     scene_eval_pools[scene_id] = eval_annotations
                     manyview_scene_ids.add(scene_id)
+            category_stats["manyview_sequences_total"] = len(manyview_sequences_seen)
+            category_stats["manyview_sequences_usable"] = len(manyview_scene_ids)
 
             if fewview_paths:
                 fewview_annotations_by_sequence: dict[str, list[CO3DFrameAnnotation]] = {}
@@ -743,6 +760,7 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
                         for sequence_name, annotations in grouped.items():
                             fewview_annotations_by_sequence.setdefault(sequence_name, []).extend(annotations)
 
+                category_stats["fewview_sequences_total"] = len(fewview_annotations_by_sequence)
                 for sequence_name, annotations in fewview_annotations_by_sequence.items():
                     scene_id = _co3d_scene_id(category_name, sequence_name)
                     if scene_id in manyview_scene_ids:
@@ -759,10 +777,23 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
                         continue
                     scene_train_pools[scene_id] = train_annotations
                     scene_eval_pools[scene_id] = eval_annotations
+                    category_stats["fewview_sequences_usable"] += 1
+            category_debug_stats[category_name] = category_stats
+            debug_log(
+                "[co3d] category stats | "
+                f"{category_name} annotations={category_stats['annotations_with_existing_images']} "
+                f"manyview_files={category_stats['manyview_files']} "
+                f"manyview_sequences={category_stats['manyview_sequences_total']} "
+                f"manyview_usable={category_stats['manyview_sequences_usable']} "
+                f"fewview_files={category_stats['fewview_files']} "
+                f"fewview_sequences={category_stats['fewview_sequences_total']} "
+                f"fewview_usable={category_stats['fewview_sequences_usable']}"
+            )
 
         self.available_categories = tuple(sorted(available_categories))
         self.skipped_categories = tuple(sorted(skipped_categories))
         self.category_set_lists = dict(sorted(category_set_lists.items()))
+        self.category_debug_stats = dict(sorted(category_debug_stats.items()))
         if not self.available_categories:
             raise FileNotFoundError(
                 f"No CO3D categories under {self.root} contain usable set_lists json files"
@@ -782,7 +813,11 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
             available_scene_ids=available_scene_ids,
         )
         if not self.scenes:
-            raise ValueError(f"no usable CO3D scenes found under {self.root}")
+            debug_preview = json.dumps(self.category_debug_stats, indent=2)
+            raise ValueError(
+                f"no usable CO3D scenes found under {self.root}\n"
+                f"category_debug_stats={debug_preview}"
+            )
 
         self.train_pools = {
             scene_id: tuple(scene_train_pools[scene_id])
