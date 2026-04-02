@@ -228,6 +228,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Run held-out masked reconstruction eval every N steps.",
     )
     parser.add_argument(
+        "--cache-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Cache decoded dataset images in RAM. Disable with --no-cache-images to avoid host-memory growth.",
+    )
+    parser.add_argument(
         "--max-vis-views",
         type=int,
         default=4,
@@ -402,6 +408,7 @@ def build_dataset(
             set_list_name=args.co3d_set_list,
             size=dataset_size,
             fallback_eval_ratio=args.co3d_fallback_eval_ratio,
+            cache_images=args.cache_images,
         )
 
     return MaskReconstructionDataset(
@@ -413,6 +420,7 @@ def build_dataset(
         eval_query_views=args.eval_query_views,
         eval_split=args.eval_split,
         size=dataset_size,
+        cache_images=args.cache_images,
     )
 
 
@@ -851,7 +859,8 @@ def main() -> None:
     log_progress("starting da3-mask training")
     log_progress(
         f"args parsed | dataset={args.dataset} backbone={args.backbone} head={args.head_type} "
-        f"steps={args.steps} batch_size={args.batch_size} root={args.root}"
+        f"steps={args.steps} batch_size={args.batch_size} root={args.root} "
+        f"cache_images={args.cache_images}"
     )
     if args.resume is not None and args.output_dir is None:
         output_dir = args.resume.resolve().parent
@@ -945,6 +954,7 @@ def main() -> None:
         f"train_query={args.train_query_views} eval_query={args.eval_query_views} "
         f"eval_split={'test' if args.dataset == 'co3d' else args.eval_split} mask_ratio={args.mask_ratio:.3f} "
         f"bg_thresh={args.background_threshold:.3f} "
+        f"cache_images={args.cache_images} "
         f"output_dir={output_dir} trainable_params={trainable_params} "
         f"optimizer={args.optimizer} lr={args.lr} backbone_trainable={args.backbone_trainable}"
     )
@@ -1152,6 +1162,7 @@ def main() -> None:
         "mask_ratio": args.mask_ratio,
         "mask_fill_value": args.mask_fill_value,
         "background_threshold": args.background_threshold,
+        "cache_images": args.cache_images,
         "dataset": args.dataset,
         "root": str(args.root),
         "co3d_set_list": args.co3d_set_list if args.dataset == "co3d" else None,
