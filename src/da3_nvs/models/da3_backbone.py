@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import MethodType
 
 import torch
 from torch import nn
@@ -88,6 +89,70 @@ class DA3PatchBackbone(nn.Module):
         self.model = model
         inner_model = model.model
         self.feature_net = inner_model.anyview if hasattr(inner_model, "anyview") else inner_model
+        self._install_patch_token_bias_hook()
+
+    def _install_patch_token_bias_hook(self) -> None:
+        assert self.feature_net is not None
+        backbone = getattr(self.feature_net, "backbone", None)
+        vit = getattr(backbone, "pretrained", None)
+        if vit is None or getattr(vit, "_da3_patch_bias_hook_installed", False):
+            return
+
+        def prepare_tokens_with_patch_bias(module_self, x, masks=None, cls_token=None, **kwargs):
+            from einops import rearrange
+
+            del cls_token, kwargs
+            batch_size, num_views, _, width, height = x.shape
+            x = rearrange(x, "b s c h w -> (b s) c h w")
+            x = module_self.patch_embed(x)
+            patch_bias = getattr(module_self, "_external_patch_token_bias", None)
+            if patch_bias is not None:
+                expected_shape = (batch_size, num_views, x.shape[1], x.shape[2])
+                if tuple(patch_bias.shape) != expected_shape:
+                    raise ValueError(
+                        "patch_token_bias must have shape "
+                        f"{expected_shape}, got {tuple(patch_bias.shape)}"
+                    )
+                x = x + patch_bias.to(device=x.device, dtype=x.dtype).reshape(
+                    batch_size * num_views,
+                    x.shape[1],
+                    x.shape[2],
+                )
+            if masks is not None:
+                x = torch.where(masks.unsqueeze(-1), module_self.mask_token.to(x.dtype).unsqueeze(0), x)
+            cls_token = module_self.prepare_cls_token(batch_size, num_views)
+            x = torch.cat((cls_token, x), dim=1)
+            x = x + module_self.interpolate_pos_encoding(x, width, height)
+            if module_self.register_tokens is not None:
+                x = torch.cat(
+                    (
+                        x[:, :1],
+                        module_self.register_tokens.expand(x.shape[0], -1, -1),
+                        x[:, 1:],
+                    ),
+                    dim=1,
+                )
+            return rearrange(x, "(b s) n c -> b s n c", b=batch_size, s=num_views)
+
+        vit.prepare_tokens_with_masks = MethodType(prepare_tokens_with_patch_bias, vit)
+        vit._da3_patch_bias_hook_installed = True
+
+    def get_embed_dim(self) -> int:
+        self._ensure_loaded()
+        assert self.feature_net is not None
+        backbone = getattr(self.feature_net, "backbone", None)
+        candidate_modules = [
+            backbone,
+            getattr(backbone, "pretrained", None),
+            getattr(getattr(backbone, "pretrained", None), "patch_embed", None),
+        ]
+        for module in candidate_modules:
+            if module is None:
+                continue
+            embed_dim = getattr(module, "embed_dim", None)
+            if isinstance(embed_dim, int):
+                return embed_dim
+        raise RuntimeError("Could not determine DA3 backbone embedding dimension")
 
     def _load_weights(self, model: nn.Module, weights_path: str) -> None:
         path = Path(weights_path)
@@ -113,6 +178,7 @@ class DA3PatchBackbone(nn.Module):
         *,
         extrinsics: torch.Tensor | None = None,
         intrinsics: torch.Tensor | None = None,
+        patch_token_bias: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         if images.dim() != 5:
             raise ValueError("images must have shape (B, V, 3, H, W)")
@@ -133,6 +199,10 @@ class DA3PatchBackbone(nn.Module):
         if next(self.model.parameters()).device != images.device:
             self.model = self.model.to(images.device)
 
+        vit = getattr(getattr(self.feature_net, "backbone", None), "pretrained", None)
+        if patch_token_bias is not None and vit is None:
+            raise RuntimeError("patch_token_bias is only supported for the DA3 DinoVisionTransformer backbone")
+
         cam_token = None
         if self.use_camera_token:
             if extrinsics is None or intrinsics is None:
@@ -141,13 +211,19 @@ class DA3PatchBackbone(nn.Module):
                 cam_token = self.feature_net.cam_enc(extrinsics, intrinsics, images.shape[-2:])
 
         grad_context = torch.enable_grad() if self.trainable else torch.no_grad()
-        with grad_context:
-            feats, _ = self.feature_net.backbone(
-                images,
-                cam_token=cam_token,
-                export_feat_layers=[],
-                ref_view_strategy=self.ref_view_strategy,
-            )
+        if vit is not None:
+            vit._external_patch_token_bias = patch_token_bias
+        try:
+            with grad_context:
+                feats, _ = self.feature_net.backbone(
+                    images,
+                    cam_token=cam_token,
+                    export_feat_layers=[],
+                    ref_view_strategy=self.ref_view_strategy,
+                )
+        finally:
+            if vit is not None:
+                vit._external_patch_token_bias = None
 
         if self.return_all_features:
             stage_tokens = [feat[0] for feat in feats]

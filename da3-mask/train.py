@@ -440,6 +440,8 @@ def materialize_trainable_modules(
         support_images=batch.support_images,
         query_images=query_images,
         query_patch_mask=patch_mask,
+        query_intrinsics=batch.train_query_intrinsics,
+        query_c2w=batch.train_query_c2w,
     )
 
 
@@ -537,8 +539,12 @@ def run_masked_step(
     batch = move_mask_batch(batch, device)
     if split == "train":
         query_images = batch.train_query_images
+        query_intrinsics = batch.train_query_intrinsics
+        query_c2w = batch.train_query_c2w
     elif split == "eval":
         query_images = batch.eval_query_images
+        query_intrinsics = batch.eval_query_intrinsics
+        query_c2w = batch.eval_query_c2w
     else:
         raise ValueError(f"Unsupported split: {split}")
 
@@ -553,6 +559,8 @@ def run_masked_step(
         support_images=batch.support_images,
         query_images=query_images,
         query_patch_mask=patch_mask,
+        query_intrinsics=query_intrinsics,
+        query_c2w=query_c2w,
     )
     patch_metrics = compute_masked_patch_metrics(
         outputs.pred_patch_rgb,
@@ -608,6 +616,8 @@ def train_step(
         support_images=batch.support_images,
         query_images=batch.train_query_images,
         query_patch_mask=patch_mask,
+        query_intrinsics=batch.train_query_intrinsics,
+        query_c2w=batch.train_query_c2w,
     )
     patch_metrics = compute_masked_patch_metrics(
         outputs.pred_patch_rgb,

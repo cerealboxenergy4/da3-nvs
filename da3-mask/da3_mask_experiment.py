@@ -14,6 +14,7 @@ from torch import nn
 from torch.utils.data import Dataset
 
 from da3_nvs.config import POC_NERF_SYNTHETIC_SCENES
+from da3_nvs.data import raymap_from_cameras
 from da3_nvs.data.nerf_synthetic import (
     BlenderFrame,
     BlenderScene,
@@ -22,7 +23,7 @@ from da3_nvs.data.nerf_synthetic import (
     _load_scene,
     _select_frames,
 )
-from da3_nvs.models import CrossAttentionNVSHead, DA3PatchBackbone
+from da3_nvs.models import CrossAttentionNVSHead, DA3PatchBackbone, RayMapEncoder
 from da3_nvs.models.common import num_patches, patchify, unpatchify
 
 
@@ -229,6 +230,20 @@ class ToyMultiStageBackbone(ToyPatchBackbone):
         ]
 
 
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
 class LightweightCNNDecoder(nn.Module):
     def __init__(
         self,
@@ -238,24 +253,26 @@ class LightweightCNNDecoder(nn.Module):
         out_channels: int = 3,
     ) -> None:
         super().__init__()
+        bottleneck_dim = max(hidden_dim * 2, 32)
+        refine_dim = max(hidden_dim // 2, 16)
         self.token_norm = nn.LayerNorm(embed_dim)
         self.proj = nn.Conv2d(embed_dim, hidden_dim, kernel_size=1, stride=1, padding=0)
-        self.block1 = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-        )
-        self.block2 = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
+        self.encoder = ConvBlock(hidden_dim, hidden_dim)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(hidden_dim, bottleneck_dim, kernel_size=3, stride=2, padding=1),
             nn.GELU(),
         )
+        self.bottleneck = ConvBlock(bottleneck_dim, bottleneck_dim)
+        self.up_project = nn.Sequential(
+            nn.Conv2d(bottleneck_dim, hidden_dim, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+        )
+        self.decoder = ConvBlock(hidden_dim * 2, hidden_dim)
+        self.refine = ConvBlock(hidden_dim, refine_dim)
         self.head = nn.Sequential(
-            nn.Conv2d(hidden_dim, max(hidden_dim // 2, 16), kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(refine_dim, refine_dim, kernel_size=3, stride=1, padding=1),
             nn.GELU(),
-            nn.Conv2d(max(hidden_dim // 2, 16), out_channels, kernel_size=1, stride=1, padding=0),
+            nn.Conv2d(refine_dim, out_channels, kernel_size=1, stride=1, padding=0),
         )
 
     def forward(
@@ -279,21 +296,25 @@ class LightweightCNNDecoder(nn.Module):
 
         flat_tokens = self.token_norm(tokens.reshape(batch_size * num_views, num_patches, embed_dim))
         feature_map = flat_tokens.transpose(1, 2).reshape(batch_size * num_views, embed_dim, patch_height, patch_width)
-        feature_map = self.proj(feature_map)
-        feature_map = self.block1(feature_map)
+        skip = self.encoder(self.proj(feature_map))
+        down = self.downsample(skip)
+        bottleneck = self.bottleneck(down)
+        up = F.interpolate(
+            bottleneck,
+            size=skip.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+        up = self.up_project(up)
+        feature_map = self.decoder(torch.cat([skip, up], dim=1))
         feature_map = F.interpolate(
             feature_map,
             size=(max(image_size[0] // 2, 1), max(image_size[1] // 2, 1)),
             mode="bilinear",
             align_corners=True,
         )
-        feature_map = self.block2(feature_map)
-        feature_map = F.interpolate(
-            feature_map,
-            size=image_size,
-            mode="bilinear",
-            align_corners=True,
-        )
+        feature_map = self.refine(feature_map)
+        feature_map = F.interpolate(feature_map, size=image_size, mode="bilinear", align_corners=True)
         pred_rgb = torch.sigmoid(self.head(feature_map))
         return pred_rgb.reshape(batch_size, num_views, pred_rgb.shape[1], image_size[0], image_size[1])
 
@@ -1075,6 +1096,7 @@ class DA3MaskedPatchModel(nn.Module):
         mlp_ratio: float = 4.0,
         decoder_hidden_dim: int | None = 128,
         mask_fill_value: float = 0.0,
+        include_moment: bool = True,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -1084,6 +1106,8 @@ class DA3MaskedPatchModel(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.decoder_hidden_dim = decoder_hidden_dim
         self.mask_fill_value = mask_fill_value
+        self.include_moment = include_moment
+        self.ray_channels = 9 if include_moment else 6
         if self.head_type not in {"mlp", "cnn", "dpt"}:
             raise ValueError(f"Unsupported head_type: {self.head_type}")
 
@@ -1102,6 +1126,7 @@ class DA3MaskedPatchModel(nn.Module):
         self.patch_head: nn.Module | None = None
         self.cnn_head: LightweightCNNDecoder | None = None
         self.dpt_head: CrossAttentionNVSHead | None = None
+        self.query_ray_encoder: RayMapEncoder | None = None
 
     @staticmethod
     def _normalize_backbone_outputs(
@@ -1151,12 +1176,71 @@ class DA3MaskedPatchModel(nn.Module):
             out_channels=3,
         ).to(device)
 
+    def _build_query_ray_encoder(self, embed_dim: int, device: torch.device) -> None:
+        if self.query_ray_encoder is not None:
+            return
+
+        self.query_ray_encoder = RayMapEncoder(
+            patch_size=self.patch_size,
+            embed_dim=embed_dim,
+            ray_channels=self.ray_channels,
+        ).to(device)
+
+    def _infer_backbone_embed_dim(self) -> int:
+        embed_dim = getattr(self.backbone, "embed_dim", None)
+        if isinstance(embed_dim, int):
+            return embed_dim
+        proj = getattr(self.backbone, "proj", None)
+        if isinstance(proj, nn.Linear):
+            return proj.out_features
+        if isinstance(self.backbone, DA3PatchBackbone):
+            return self.backbone.get_embed_dim()
+        raise RuntimeError("Could not infer backbone embedding dimension for query ray embeddings")
+
+    def _build_masked_query_ray_bias(
+        self,
+        *,
+        query_intrinsics: torch.Tensor | None,
+        query_c2w: torch.Tensor | None,
+        query_patch_mask: torch.Tensor,
+        image_size: tuple[int, int],
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        if query_intrinsics is None or query_c2w is None:
+            return None
+
+        batch_size, query_views = query_intrinsics.shape[:2]
+        raymaps = raymap_from_cameras(
+            query_intrinsics.reshape(batch_size * query_views, 3, 3),
+            query_c2w.reshape(batch_size * query_views, *query_c2w.shape[-2:]),
+            image_size[0],
+            image_size[1],
+            include_moment=self.include_moment,
+        )
+        embed_dim = self._infer_backbone_embed_dim()
+        self._build_query_ray_encoder(embed_dim, device)
+        assert self.query_ray_encoder is not None
+        ray_tokens = self.query_ray_encoder(raymaps.to(device)).reshape(
+            batch_size,
+            query_views,
+            -1,
+            embed_dim,
+        )
+        if ray_tokens.shape[:3] != query_patch_mask.shape:
+            raise RuntimeError(
+                "Query ray token layout does not match masked query patch layout: "
+                f"{tuple(ray_tokens.shape[:3])} vs {tuple(query_patch_mask.shape)}"
+            )
+        return ray_tokens * query_patch_mask.unsqueeze(-1).to(dtype=ray_tokens.dtype)
+
     def forward(
         self,
         *,
         support_images: torch.Tensor,
         query_images: torch.Tensor,
         query_patch_mask: torch.Tensor,
+        query_intrinsics: torch.Tensor | None = None,
+        query_c2w: torch.Tensor | None = None,
     ) -> MaskedPatchOutputs:
         if support_images.dim() != 5 or query_images.dim() != 5:
             raise ValueError("support_images and query_images must have shape (B, V, C, H, W)")
@@ -1175,6 +1259,10 @@ class DA3MaskedPatchModel(nn.Module):
 
         device = query_images.device
         query_patch_mask = query_patch_mask.to(device)
+        if query_intrinsics is not None:
+            query_intrinsics = query_intrinsics.to(device)
+        if query_c2w is not None:
+            query_c2w = query_c2w.to(device)
         masked_query_images = apply_patch_mask(
             query_images,
             query_patch_mask,
@@ -1182,11 +1270,31 @@ class DA3MaskedPatchModel(nn.Module):
             fill_value=self.mask_fill_value,
         )
         encoder_images = torch.cat([support_images, masked_query_images], dim=1)
-        backbone_outputs = self.backbone(encoder_images)
+        query_ray_bias = self._build_masked_query_ray_bias(
+            query_intrinsics=query_intrinsics,
+            query_c2w=query_c2w,
+            query_patch_mask=query_patch_mask,
+            image_size=(height, width),
+            device=device,
+        )
+        backbone_kwargs: dict[str, torch.Tensor] = {}
+        if query_ray_bias is not None and isinstance(self.backbone, DA3PatchBackbone):
+            support_ray_bias = torch.zeros(
+                batch_size,
+                support_images.shape[1],
+                expected_patches,
+                query_ray_bias.shape[-1],
+                device=device,
+                dtype=query_ray_bias.dtype,
+            )
+            backbone_kwargs["patch_token_bias"] = torch.cat([support_ray_bias, query_ray_bias], dim=1)
+        backbone_outputs = self.backbone(encoder_images, **backbone_kwargs)
         stage_tokens = self._normalize_backbone_outputs(backbone_outputs)
         support_views = support_images.shape[1]
         support_stage_tokens = [tokens[:, :support_views, :, :] for tokens in stage_tokens]
         query_stage_tokens = [tokens[:, support_views:, :, :] for tokens in stage_tokens]
+        if query_ray_bias is not None and not isinstance(self.backbone, DA3PatchBackbone):
+            query_stage_tokens = [stage + query_ray_bias for stage in query_stage_tokens]
         all_tokens = query_stage_tokens[-1]
         if all_tokens.dim() != 4:
             raise RuntimeError(f"Expected backbone tokens with shape (B, V, P, D), got {all_tokens.shape}")
