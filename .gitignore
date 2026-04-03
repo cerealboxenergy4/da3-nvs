@@ -4,4 +4,4 @@ outline.md
 *.err
 *.out
 *.pyc
-__pycache__/
+**/__pycache__/
