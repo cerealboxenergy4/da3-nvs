@@ -112,9 +112,9 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--head-type",
-        choices=("mlp", "cnn", "dpt"),
+        choices=("mlp", "cnn", "dpt", "hybrid"),
         default="dpt",
-        help="Use the patch-wise MLP head, a lightweight CNN decoder, or a DPT decoder driven by stage-wise cross-attention.",
+        help="Use the patch-wise MLP head, a lightweight CNN decoder, a DPT decoder driven by stage-wise cross-attention, or a hybrid stage-wise cross-attention plus CNN decoder.",
     )
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--support-views", type=int, default=16)

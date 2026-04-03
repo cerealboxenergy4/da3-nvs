@@ -23,7 +23,12 @@ from da3_nvs.data.nerf_synthetic import (
     _load_scene,
     _select_frames,
 )
-from da3_nvs.models import CrossAttentionNVSHead, DA3PatchBackbone, RayMapEncoder
+from da3_nvs.models import (
+    CrossAttentionNVSHead,
+    DA3PatchBackbone,
+    HybridCrossAttentionCNNNVSHead,
+    RayMapEncoder,
+)
 from da3_nvs.models.common import num_patches, patchify, unpatchify
 
 
@@ -513,8 +518,8 @@ def _load_co3d_frame_annotations(
         if required_keys is not None and key not in required_keys:
             continue
         image_path = dataset_root / item["image"]["path"]
-        if not image_path.exists():
-            continue
+        # if not image_path.exists():
+        #     continue
 
         mask_info = item.get("mask")
         mask_path = dataset_root / mask_info["path"] if isinstance(mask_info, dict) else None
@@ -523,7 +528,9 @@ def _load_co3d_frame_annotations(
             sequence_name=key[0],
             frame_number=key[1],
             image_path=image_path,
-            mask_path=mask_path if mask_path is not None and mask_path.exists() else None,
+            mask_path=mask_path if mask_path is not None else None,
+            # mask_path=mask_path if mask_path is not None and mask_path.exists() else None,
+
             intrinsics=_co3d_intrinsics_from_viewpoint(
                 item["viewpoint"],
                 annotation_image_size=item["image"]["size"],
@@ -1211,14 +1218,14 @@ class DA3MaskedPatchModel(nn.Module):
         self.mask_fill_value = mask_fill_value
         self.include_moment = include_moment
         self.ray_channels = 9 if include_moment else 6
-        if self.head_type not in {"mlp", "cnn", "dpt"}:
+        if self.head_type not in {"mlp", "cnn", "dpt", "hybrid"}:
             raise ValueError(f"Unsupported head_type: {self.head_type}")
 
         self.backbone = backbone or DA3PatchBackbone(
             model_name=backbone_model_name,
             weights_path=backbone_weights_path,
             trainable=backbone_trainable,
-            return_all_features=self.head_type == "dpt",
+            return_all_features=self.head_type in {"dpt", "hybrid"},
         )
         backbone_patch_size = getattr(self.backbone, "patch_size", None)
         if backbone_patch_size is not None and backbone_patch_size != self.patch_size:
@@ -1229,6 +1236,7 @@ class DA3MaskedPatchModel(nn.Module):
         self.patch_head: nn.Module | None = None
         self.cnn_head: LightweightCNNDecoder | None = None
         self.dpt_head: CrossAttentionNVSHead | None = None
+        self.hybrid_head: HybridCrossAttentionCNNNVSHead | None = None
         self.query_ray_encoder: RayMapEncoder | None = None
 
     @staticmethod
@@ -1260,6 +1268,19 @@ class DA3MaskedPatchModel(nn.Module):
             return
 
         self.dpt_head = CrossAttentionNVSHead(
+            embed_dim=embed_dim,
+            patch_size=self.patch_size,
+            num_heads=self.num_heads,
+            mlp_ratio=self.mlp_ratio,
+            decoder_hidden_dim=self.decoder_hidden_dim,
+            out_channels=3,
+        ).to(device)
+
+    def _build_hybrid_head(self, embed_dim: int, device: torch.device) -> None:
+        if self.hybrid_head is not None:
+            return
+
+        self.hybrid_head = HybridCrossAttentionCNNNVSHead(
             embed_dim=embed_dim,
             patch_size=self.patch_size,
             num_heads=self.num_heads,
@@ -1441,7 +1462,7 @@ class DA3MaskedPatchModel(nn.Module):
                 pred_query_images.reshape(batch_size * query_views, channels, height, width),
                 self.patch_size,
             ).reshape(batch_size, query_views, expected_patches, -1)
-        else:
+        elif self.head_type == "dpt":
             self._build_dpt_head(embed_dim, device)
             assert self.dpt_head is not None
             support_stage_memory = [
@@ -1449,6 +1470,22 @@ class DA3MaskedPatchModel(nn.Module):
                 for stage in support_stage_tokens
             ]
             pred_query_images, rendered_tokens = self.dpt_head(
+                query_tokens,
+                support_stage_memory,
+                image_size=(height, width),
+            )
+            pred_patch_rgb = patchify(
+                pred_query_images.reshape(batch_size * query_views, channels, height, width),
+                self.patch_size,
+            ).reshape(batch_size, query_views, expected_patches, -1)
+        else:
+            self._build_hybrid_head(embed_dim, device)
+            assert self.hybrid_head is not None
+            support_stage_memory = [
+                stage.reshape(batch_size, -1, embed_dim)
+                for stage in support_stage_tokens
+            ]
+            pred_query_images, rendered_tokens = self.hybrid_head(
                 query_tokens,
                 support_stage_memory,
                 image_size=(height, width),

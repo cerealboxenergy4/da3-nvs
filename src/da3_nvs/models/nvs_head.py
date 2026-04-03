@@ -324,6 +324,112 @@ class HalfResCNNEncoder(nn.Module):
         return self.encoder(x)
 
 
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class TokenUNetRGBDecoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        patch_size: int,
+        hidden_dim: int | None = None,
+        out_channels: int = 3,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim or min(256, max(embed_dim // 2, 32))
+        bottleneck_dim = max(self.hidden_dim * 2, 32)
+        refine_dim = max(self.hidden_dim // 2, 16)
+
+        self.token_norm = nn.LayerNorm(embed_dim)
+        self.proj = nn.Conv2d(embed_dim, self.hidden_dim, kernel_size=1, stride=1, padding=0)
+        self.encoder = ConvBlock(self.hidden_dim, self.hidden_dim)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(self.hidden_dim, bottleneck_dim, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.bottleneck = ConvBlock(bottleneck_dim, bottleneck_dim)
+        self.up_project = nn.Sequential(
+            nn.Conv2d(bottleneck_dim, self.hidden_dim, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+        )
+        self.decoder = ConvBlock(self.hidden_dim * 2, self.hidden_dim)
+        self.refine = ConvBlock(self.hidden_dim, refine_dim)
+        self.head = nn.Sequential(
+            nn.Conv2d(refine_dim, refine_dim, kernel_size=3, stride=1, padding=1),
+            nn.GELU(),
+            nn.Conv2d(refine_dim, out_channels, kernel_size=1, stride=1, padding=0),
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        *,
+        image_size: tuple[int, int],
+    ) -> torch.Tensor:
+        if tokens.dim() != 4:
+            raise ValueError("tokens must have shape (B, V, P, D)")
+
+        batch_size, num_views, num_patches, embed_dim = tokens.shape
+        if embed_dim != self.embed_dim:
+            raise ValueError(f"Expected embed_dim={self.embed_dim}, got {embed_dim}")
+
+        patch_height = image_size[0] // self.patch_size
+        patch_width = image_size[1] // self.patch_size
+        if patch_height * patch_width != num_patches:
+            raise ValueError(
+                "Token count does not match image patch grid: "
+                f"{num_patches} vs {patch_height}x{patch_width}"
+            )
+
+        flat_tokens = self.token_norm(tokens.reshape(batch_size * num_views, num_patches, embed_dim))
+        feature_map = flat_tokens.transpose(1, 2).reshape(
+            batch_size * num_views,
+            embed_dim,
+            patch_height,
+            patch_width,
+        )
+        skip = self.encoder(self.proj(feature_map))
+        down = self.downsample(skip)
+        bottleneck = self.bottleneck(down)
+        up = custom_interpolate(
+            bottleneck,
+            size=skip.shape[-2:],
+            mode="bilinear",
+            align_corners=True,
+        )
+        up = self.up_project(up)
+        feature_map = self.decoder(torch.cat([skip, up], dim=1))
+        feature_map = custom_interpolate(
+            feature_map,
+            size=(max(image_size[0] // 2, 1), max(image_size[1] // 2, 1)),
+            mode="bilinear",
+            align_corners=True,
+        )
+        feature_map = self.refine(feature_map)
+        feature_map = custom_interpolate(
+            feature_map,
+            size=image_size,
+            mode="bilinear",
+            align_corners=True,
+        )
+        pred_rgb = torch.sigmoid(self.head(feature_map))
+        return pred_rgb.reshape(batch_size, num_views, pred_rgb.shape[1], image_size[0], image_size[1])
+
+
 class CrossAttentionNVSHead(nn.Module):
     def __init__(
         self,
@@ -510,4 +616,120 @@ class CrossAttentionNVSHead(nn.Module):
             query_ray_skip=query_ray_skip,
             support_rgb_skip=aggregated_support_rgb_skip,
         )
+        return pred_rgb, rendered_tokens
+
+
+class HybridCrossAttentionCNNNVSHead(nn.Module):
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        patch_size: int,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        decoder_hidden_dim: int | None = None,
+        out_channels: int = 3,
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(embed_dim * mlp_ratio)
+        resolved_heads = _resolve_num_heads(embed_dim, num_heads)
+        self.num_heads = resolved_heads
+        self.head_dim = embed_dim // resolved_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.query_norm = nn.LayerNorm(embed_dim)
+        self.memory_norm = nn.LayerNorm(embed_dim)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.ffn_norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        self.decoder = TokenUNetRGBDecoder(
+            embed_dim=embed_dim,
+            patch_size=patch_size,
+            hidden_dim=decoder_hidden_dim,
+            out_channels=out_channels,
+        )
+
+    def forward(
+        self,
+        query_tokens: torch.Tensor,
+        memory_tokens: torch.Tensor | Sequence[torch.Tensor],
+        *,
+        image_size: tuple[int, int],
+        epipolar_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if query_tokens.dim() != 4:
+            raise ValueError("query_tokens must have shape (B, V, P, D)")
+
+        batch_size, num_views, num_patches, embed_dim = query_tokens.shape
+        flat_queries = query_tokens.reshape(batch_size, num_views * num_patches, embed_dim)
+        if isinstance(memory_tokens, torch.Tensor):
+            memory_stages = [memory_tokens]
+        else:
+            memory_stages = list(memory_tokens)
+        if not memory_stages:
+            raise ValueError("memory_tokens must contain at least one stage")
+        for stage_idx, stage_memory in enumerate(memory_stages):
+            if stage_memory.dim() != 3:
+                raise ValueError(
+                    f"memory_tokens stage {stage_idx} must have shape (B, T, D), got {stage_memory.shape}"
+                )
+
+        fused_queries = flat_queries
+        for stage_idx, stage_memory in enumerate(memory_stages):
+            normalized_query = self.query_norm(fused_queries)
+            normalized_memory = self.memory_norm(stage_memory)
+            if epipolar_mask is not None and epipolar_mask.shape != (
+                batch_size,
+                fused_queries.shape[1],
+                normalized_memory.shape[1],
+            ):
+                raise ValueError(
+                    "epipolar_mask must have shape "
+                    f"{(batch_size, fused_queries.shape[1], normalized_memory.shape[1])}, "
+                    f"got {tuple(epipolar_mask.shape)}"
+                )
+
+            q = self.q_proj(normalized_query).reshape(
+                batch_size,
+                fused_queries.shape[1],
+                self.num_heads,
+                self.head_dim,
+            ).transpose(1, 2)
+            k = self.k_proj(normalized_memory).reshape(
+                batch_size,
+                normalized_memory.shape[1],
+                self.num_heads,
+                self.head_dim,
+            ).transpose(1, 2)
+            v = self.v_proj(normalized_memory).reshape(
+                batch_size,
+                normalized_memory.shape[1],
+                self.num_heads,
+                self.head_dim,
+            ).transpose(1, 2)
+
+            attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            if epipolar_mask is not None:
+                attn_logits = attn_logits.masked_fill(
+                    ~epipolar_mask[:, None, :, :],
+                    torch.finfo(attn_logits.dtype).min,
+                )
+            attn = torch.softmax(attn_logits, dim=-1)
+            attended = torch.matmul(attn, v).transpose(1, 2).reshape(
+                batch_size,
+                fused_queries.shape[1],
+                embed_dim,
+            )
+            fused_queries = fused_queries + self.out_proj(attended)
+
+        rendered = fused_queries + self.ffn(self.ffn_norm(fused_queries))
+        rendered_tokens = rendered.reshape(batch_size, num_views, num_patches, embed_dim)
+        pred_rgb = self.decoder(rendered_tokens, image_size=image_size)
         return pred_rgb, rendered_tokens
