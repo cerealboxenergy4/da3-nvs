@@ -499,6 +499,7 @@ def _load_co3d_frame_annotations(
     category_root: Path,
     *,
     image_size: int,
+    required_keys: set[tuple[str, int]] | None = None,
 ) -> dict[tuple[str, int], CO3DFrameAnnotation]:
     dataset_root = category_root.parent
     category_name = category_root.name
@@ -508,6 +509,9 @@ def _load_co3d_frame_annotations(
 
     annotations: dict[tuple[str, int], CO3DFrameAnnotation] = {}
     for item in raw_annotations:
+        key = (str(item["sequence_name"]), int(item["frame_number"]))
+        if required_keys is not None and key not in required_keys:
+            continue
         image_path = dataset_root / item["image"]["path"]
         if not image_path.exists():
             continue
@@ -516,8 +520,8 @@ def _load_co3d_frame_annotations(
         mask_path = dataset_root / mask_info["path"] if isinstance(mask_info, dict) else None
         annotation = CO3DFrameAnnotation(
             category_name=category_name,
-            sequence_name=item["sequence_name"],
-            frame_number=int(item["frame_number"]),
+            sequence_name=key[0],
+            frame_number=key[1],
             image_path=image_path,
             mask_path=mask_path if mask_path is not None and mask_path.exists() else None,
             intrinsics=_co3d_intrinsics_from_viewpoint(
@@ -527,7 +531,7 @@ def _load_co3d_frame_annotations(
             ),
             c2w=_co3d_c2w_from_viewpoint(item["viewpoint"]),
         )
-        annotations[(annotation.sequence_name, annotation.frame_number)] = annotation
+        annotations[key] = annotation
     return annotations
 
 
@@ -543,10 +547,54 @@ def _list_co3d_set_list_paths(category_root: Path) -> list[Path]:
     return sorted(set_lists_dir.glob("*.json"))
 
 
+def _select_co3d_set_list_paths(
+    category_root: Path,
+    *,
+    preferred_name: str | None,
+) -> list[Path]:
+    set_list_paths = _list_co3d_set_list_paths(category_root)
+    if not set_list_paths or preferred_name is None:
+        return set_list_paths
+
+    exact_matches = [path for path in set_list_paths if path.name == preferred_name]
+    if exact_matches:
+        return exact_matches
+
+    if "manyview" in preferred_name:
+        family_matches = [path for path in set_list_paths if "manyview" in path.name]
+        if family_matches:
+            return family_matches
+    if "fewview" in preferred_name:
+        family_matches = [path for path in set_list_paths if "fewview" in path.name]
+        if family_matches:
+            return family_matches
+    return set_list_paths
+
+
 def _split_co3d_set_list_paths(set_list_paths: list[Path]) -> tuple[list[Path], list[Path]]:
     manyview_paths = [path for path in set_list_paths if "manyview" in path.name]
     fewview_paths = [path for path in set_list_paths if "fewview" in path.name]
     return manyview_paths, fewview_paths
+
+
+def _collect_annotation_keys_from_split_entries(raw_split_entries: dict | list) -> set[tuple[str, int]]:
+    required_keys: set[tuple[str, int]] = set()
+    if isinstance(raw_split_entries, dict):
+        split_groups = raw_split_entries.values()
+    elif isinstance(raw_split_entries, list):
+        split_groups = [raw_split_entries]
+    else:
+        return required_keys
+
+    for split_entries in split_groups:
+        if not isinstance(split_entries, list):
+            continue
+        for entry in split_entries:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                continue
+            sequence_name, frame_number = entry[0], entry[1]
+            required_keys.add((str(sequence_name), int(frame_number)))
+    return required_keys
 
 
 def _entries_to_annotations_by_sequence(
@@ -605,6 +653,33 @@ def _iter_co3d_category_roots(root: Path) -> list[Path]:
             f"got {root}"
         )
     return category_roots
+
+
+def _filter_requested_co3d_category_roots(
+    category_roots: list[Path],
+    requested_names: tuple[str, ...] | None,
+) -> list[Path]:
+    if requested_names is None:
+        return category_roots
+
+    roots_by_name = {path.name: path for path in category_roots}
+    selected: list[Path] = []
+    saw_category_hint = False
+    for name in requested_names:
+        if "/" in name:
+            category_name = name.split("/", 1)[0]
+            saw_category_hint = True
+            root = roots_by_name.get(category_name)
+            if root is not None:
+                selected.append(root)
+            continue
+        if name in roots_by_name:
+            saw_category_hint = True
+            selected.append(roots_by_name[name])
+
+    if not saw_category_hint:
+        return category_roots
+    return sorted({path.resolve(): path for path in selected}.values(), key=lambda path: path.name)
 
 
 def _co3d_scene_id(category_name: str, sequence_name: str) -> str:
@@ -679,13 +754,16 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
         self.white_background = white_background
         self.cache_images = cache_images
         self._image_cache: dict[Path, torch.Tensor] = {}
-        self.official_image_backends: dict[str, OfficialCo3dImageBackend] = {}
+        self.official_image_backends: dict[str, OfficialCo3dImageBackend | None] = {}
+        self.official_backend_category_roots: dict[str, Path] = {}
         self.available_categories: tuple[str, ...] = ()
         self.skipped_categories: tuple[str, ...] = ()
         self.category_set_lists: dict[str, tuple[str, ...]] = {}
         self.category_debug_stats: dict[str, dict[str, int]] = {}
 
+        requested_scene_names = sequence_names
         category_roots = _iter_co3d_category_roots(self.root)
+        category_roots = _filter_requested_co3d_category_roots(category_roots, requested_scene_names)
         debug_log(f"[co3d] scanning categories under {self.root} ({len(category_roots)} candidates)")
         scene_train_pools: dict[str, tuple[CO3DFrameAnnotation, ...]] = {}
         scene_eval_pools: dict[str, tuple[CO3DFrameAnnotation, ...]] = {}
@@ -694,14 +772,30 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
         category_set_lists: dict[str, tuple[str, ...]] = {}
         category_debug_stats: dict[str, dict[str, int]] = {}
         for category_root in category_roots:
-            set_list_paths = _list_co3d_set_list_paths(category_root)
+            set_list_paths = _select_co3d_set_list_paths(
+                category_root,
+                preferred_name=self.set_list_name,
+            )
             if not set_list_paths:
                 skipped_categories.append(category_root.name)
                 continue
 
             debug_log(f"[co3d] loading category {category_root.name}")
-            annotation_map = _load_co3d_frame_annotations(category_root, image_size=self.image_size)
             category_name = category_root.name
+            raw_split_entries_by_path = {
+                path: _load_json_file(path)
+                for path in set_list_paths
+            }
+            required_annotation_keys: set[tuple[str, int]] = set()
+            for raw_split_entries in raw_split_entries_by_path.values():
+                required_annotation_keys.update(
+                    _collect_annotation_keys_from_split_entries(raw_split_entries)
+                )
+            annotation_map = _load_co3d_frame_annotations(
+                category_root,
+                image_size=self.image_size,
+                required_keys=required_annotation_keys if required_annotation_keys else None,
+            )
             available_categories.append(category_name)
             category_set_lists[category_name] = tuple(path.name for path in set_list_paths)
             category_stats = {
@@ -713,18 +807,8 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
                 "fewview_sequences_total": 0,
                 "fewview_sequences_usable": 0,
             }
-            try:
-                self.official_image_backends[category_name] = OfficialCo3dImageBackend(
-                    category_root=category_root,
-                    image_size=self.image_size,
-                    white_background=self.white_background,
-                )
-                debug_log(f"[co3d] category {category_name} using official Co3dDataset image backend")
-            except Exception as error:
-                debug_log(
-                    f"[co3d] category {category_name} official Co3dDataset unavailable, "
-                    f"falling back to direct image loading: {error}"
-                )
+            self.official_image_backends[category_name] = None
+            self.official_backend_category_roots[category_name] = category_root
 
             manyview_paths, fewview_paths = _split_co3d_set_list_paths(set_list_paths)
             category_stats["manyview_files"] = len(manyview_paths)
@@ -732,7 +816,7 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
             manyview_scene_ids: set[str] = set()
             manyview_sequences_seen: set[str] = set()
             for path in manyview_paths:
-                raw_split_entries = _load_json_file(path)
+                raw_split_entries = raw_split_entries_by_path[path]
                 if not isinstance(raw_split_entries, dict):
                     continue
                 train_by_sequence = _entries_to_annotations_by_sequence(
@@ -773,7 +857,7 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
             if fewview_paths:
                 fewview_annotations_by_sequence: dict[str, list[CO3DFrameAnnotation]] = {}
                 for path in fewview_paths:
-                    raw_split_entries = _load_json_file(path)
+                    raw_split_entries = raw_split_entries_by_path[path]
                     if not isinstance(raw_split_entries, dict):
                         continue
                     for split_entries in raw_split_entries.values():
@@ -830,7 +914,7 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
             if scene_train_pools.get(scene_id) and scene_eval_pools.get(scene_id)
         )
         self.scenes = _resolve_requested_co3d_scene_ids(
-            sequence_names,
+            requested_scene_names,
             available_scene_ids=available_scene_ids,
         )
         if not self.scenes:
@@ -868,6 +952,25 @@ class CO3DMaskReconstructionDataset(Dataset[MaskReconstructionBatch]):
 
     def _load_co3d_image(self, annotation: CO3DFrameAnnotation) -> torch.Tensor:
         backend = self.official_image_backends.get(annotation.category_name)
+        if backend is None:
+            category_root = self.official_backend_category_roots.get(annotation.category_name)
+            if category_root is not None:
+                try:
+                    backend = OfficialCo3dImageBackend(
+                        category_root=category_root,
+                        image_size=self.image_size,
+                        white_background=self.white_background,
+                    )
+                    self.official_image_backends[annotation.category_name] = backend
+                    debug_log(
+                        f"[co3d] category {annotation.category_name} using official Co3dDataset image backend"
+                    )
+                except Exception as error:
+                    self.official_backend_category_roots.pop(annotation.category_name, None)
+                    debug_log(
+                        f"[co3d] category {annotation.category_name} official Co3dDataset unavailable, "
+                        f"falling back to direct image loading: {error}"
+                    )
         if backend is not None:
             try:
                 return backend.load_image(annotation.sequence_name, annotation.frame_number)
